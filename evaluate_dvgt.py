@@ -1,5 +1,6 @@
 import argparse
 import os
+import time
 import numpy as np
 import torch
 from PIL import Image
@@ -185,6 +186,8 @@ def main(args):
     model = model.to(device).eval()
 
     all_pose_auc, all_depth_metrics = [], []
+    total_inference_time = 0.0
+    num_sequences = 0
 
     for scene in tqdm(nusc.scene, desc="Evaluating Scenes"):
         # Traverse scene keyframes
@@ -215,8 +218,17 @@ def main(args):
 
         images_tensor = torch.stack(images).unsqueeze(0).to(device)
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start_time = time.time()
+
         with torch.no_grad(), torch.amp.autocast(device, dtype=dtype):
             preds = model(images_tensor)
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        total_inference_time += time.time() - start_time
+        num_sequences += 1
 
         ego_n_to_ego_0 = pose_encoding_to_ego_pose(preds['ego_pose_enc'])
         ray_depth_in_ego_n = convert_point_in_ego_0_to_ray_depth_in_ego_n(preds['world_points'], ego_n_to_ego_0)
@@ -276,6 +288,19 @@ def main(args):
     print("Ray Depth Metrics:")
     for k in ['abs_rel', 'delta_1']:
         print(f"  {k:8s}: {np.mean([m[k] for m in all_depth_metrics]):.4f}")
+
+    print("-" * 50)
+    print("Profiling Metrics:")
+    if num_sequences > 0:
+        avg_time = total_inference_time / num_sequences
+        fps = (args.seq_len * num_sequences) / total_inference_time
+        print(f"  Avg Inference Time (per {args.seq_len}-frame seq): {avg_time:.4f} s")
+        print(f"  Effective Inference FPS: {fps:.2f}")
+    if torch.cuda.is_available():
+        peak_vram_alloc = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        peak_vram_reserv = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+        print(f"  Peak VRAM Allocated: {peak_vram_alloc:.2f} MB")
+        print(f"  Peak VRAM Reserved:  {peak_vram_reserv:.2f} MB")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
