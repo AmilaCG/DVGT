@@ -7,6 +7,7 @@ from iopath.common.file_io import g_pathmgr
 from nuscenes.nuscenes import NuScenes
 from PIL import Image
 from torchvision import transforms as TF
+from demo_viser import visualize_pred, launch_viser_server
 
 # Predict in alphabetical order to match standard loading
 CAMERAS = [
@@ -81,8 +82,8 @@ def main(args):
         cam_img_sizes.append(sizes)
 
     print(f"Feeding {len(images)} frames, each with {len(images[0])} views")
-    # images_tensor = torch.stack(images).unsqueeze(0).to(device) # Add batch dimension
-    images_tensor = torch.stack(images).to(device)
+    images_tensor = torch.stack(images).unsqueeze(0).to(device) # With batch dimension
+    # images_tensor = torch.stack(images).to(device) # Without batch dimension
     print(f"images_tensor: {images_tensor.shape}")
 
     with torch.no_grad():
@@ -90,6 +91,18 @@ def main(args):
             # images (torch.Tensor): Input images with shape [T, V, 3, H, W] or [B, T, V, 3, H, W], in range [0, 1].
             # B: batch size, T: num_frames, V: views_per_frame, 3: RGB channels, H: height, W: width
             predictions = model(images_tensor)
+
+    vis_args = argparse.Namespace(
+        conf_threshold=25.0,
+        mask_sky=False,
+        use_edge_masks=False,
+        edge_depth_rtol=0.1,
+        edge_normal_tol=50,
+        max_depth=-1,
+        downsample_ratio=-1,
+    )
+    point_clouds, poses = visualize_pred(predictions, vis_args)
+    launch_viser_server(point_clouds, poses)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

@@ -493,6 +493,61 @@ def visualize_pred(predictions, args):
 
     return [(points_centered, colors_final, "pred_point_cloud")], poses_centered
 
+def launch_viser_server(point_clouds_to_show, poses, show_ego=True):
+    server = viser.ViserServer()
+    print("\n--- Starting Viser Server ---")
+
+    @server.on_client_connect
+    def _(client: viser.ClientHandle):
+        print(f"Client {client.client_id} connected.")
+
+        with client.gui.add_folder("Camera Info"):
+            gui_cam_wxyz = client.gui.add_text("Cam WXYZ (quat)", initial_value="...")
+            gui_cam_pos = client.gui.add_text("Cam Position (xyz)", initial_value="...")
+
+        @client.camera.on_update
+        def _(camera: viser.CameraHandle):
+            """Callback for camera updates."""
+            gui_cam_wxyz.value = str(np.round(camera.wxyz, 3))
+            gui_cam_pos.value = str(np.round(camera.position, 3))
+
+        _(client.camera)
+
+    with server.gui.add_folder("Controls"):
+        point_size_slider = server.gui.add_slider(
+            "Point Size",
+            min=0.001,
+            max=0.1,
+            step=0.01,
+            initial_value=0.01,
+        )
+
+    pc_handles = []
+    for points, colors, name in point_clouds_to_show:
+        if points.shape[0] == 0: continue
+        print(f"point shape: {points.shape}")
+        print(f"point mean: {np.mean(points, axis=0)}")
+        handle = server.scene.add_point_cloud(
+            name=f"/{name}",
+            points=points,
+            colors=colors,
+            point_size=point_size_slider.value,
+        )
+        pc_handles.append(handle)
+
+    @point_size_slider.on_update
+    def _(_) -> None:
+        """Update point size for all point clouds."""
+        for handle in pc_handles:
+            handle.point_size = point_size_slider.value
+
+    if show_ego:
+        visualize_ego_poses(server, poses)
+
+    print("\nViser server running. Open the link in your browser.")
+    while True:
+        sleep(1)
+
 def main():
     parser = argparse.ArgumentParser(description="Autonomous Driving Scene Point Cloud Visualizer")
     parser.add_argument(
@@ -539,59 +594,7 @@ def main():
     
     point_clouds_to_show, poses = visualize_pred(predictions, args)
 
-    server = viser.ViserServer()
-    print("\n--- Starting Viser Server ---")
-
-    @server.on_client_connect
-    def _(client: viser.ClientHandle):
-        print(f"Client {client.client_id} connected.")
-        
-        with client.gui.add_folder("Camera Info"):
-            gui_cam_wxyz = client.gui.add_text("Cam WXYZ (quat)", initial_value="...")
-            gui_cam_pos = client.gui.add_text("Cam Position (xyz)", initial_value="...")
-
-        @client.camera.on_update
-        def _(camera: viser.CameraHandle):
-            """Callback for camera updates."""
-            gui_cam_wxyz.value = str(np.round(camera.wxyz, 3))
-            gui_cam_pos.value = str(np.round(camera.position, 3))
-        
-        _(client.camera)
-
-    with server.gui.add_folder("Controls"):
-        point_size_slider = server.gui.add_slider(
-            "Point Size",
-            min=0.001,
-            max=0.1,
-            step=0.01,
-            initial_value=0.01,
-        )
-
-    pc_handles = []
-    for points, colors, name in point_clouds_to_show:
-        if points.shape[0] == 0: continue
-        print(f"point shape: {points.shape}")
-        print(f"point mean: {np.mean(points, axis=0)}")
-        handle = server.scene.add_point_cloud(
-            name=f"/{name}",
-            points=points,
-            colors=colors,
-            point_size=point_size_slider.value,
-        )
-        pc_handles.append(handle)
-
-    @point_size_slider.on_update
-    def _(_) -> None:
-        """Update point size for all point clouds."""
-        for handle in pc_handles:
-            handle.point_size = point_size_slider.value
-
-    if not args.no_ego:
-        visualize_ego_poses(server, poses)
-
-    print("\nViser server running. Open the link in your browser.")
-    while True:
-        sleep(1)
+    launch_viser_server(point_clouds_to_show, poses, show_ego=not args.no_ego)
 
 if __name__ == "__main__":
     main()
