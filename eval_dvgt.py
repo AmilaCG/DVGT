@@ -92,17 +92,18 @@ def main(args):
             # B: batch size, T: num_frames, V: views_per_frame, 3: RGB channels, H: height, W: width
             predictions = model(images_tensor)
 
-    vis_args = argparse.Namespace(
-        conf_threshold=25.0,
-        mask_sky=False,
-        use_edge_masks=False,
-        edge_depth_rtol=0.1,
-        edge_normal_tol=50,
-        max_depth=-1,
-        downsample_ratio=-1,
-    )
-    point_clouds, poses = visualize_pred(predictions, vis_args)
-    launch_viser_server(point_clouds, poses)
+    if (args.vis):
+        vis_args = argparse.Namespace(
+            conf_threshold=25.0,
+            mask_sky=False,
+            use_edge_masks=False,
+            edge_depth_rtol=0.1,
+            edge_normal_tol=50,
+            max_depth=-1,
+            downsample_ratio=-1,
+        )
+        point_clouds, poses = visualize_pred(predictions, vis_args)
+        launch_viser_server(point_clouds, poses)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -110,5 +111,6 @@ if __name__ == '__main__':
     # parser.add_argument('--checkpoint', type=str, default='ckpt/open_ckpt.pt')
     parser.add_argument('--frames', type=int, default=16, choices=range(1, 25), help="Frames to evaluate per scene (Max 24).")
     # parser.add_argument('--frames_chunk_size', type=int, default=8)
+    parser.add_argument('--vis', action='store_true', help='Visualize using Viser')
     args = parser.parse_args()
     main(args)
