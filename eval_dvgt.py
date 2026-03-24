@@ -1,9 +1,9 @@
 import argparse
 import os
+import time
 import torch
 import numpy as np
 from dvgt.models.dvgt import DVGT
-from dvgt.utils.load_fn import load_and_preprocess_images
 from iopath.common.file_io import g_pathmgr
 from nuscenes.nuscenes import NuScenes
 from pyquaternion import Quaternion
@@ -438,7 +438,7 @@ def main(args):
         for cam in CAMERAS:
             cam_data = nusc.get('sample_data', sample['data'][cam])
             img_path = os.path.join(nusc.dataroot, cam_data['filename'])
-            print(f"Feeding image: {os.path.basename(img_path)}")
+            # print(f"Feeding image: {os.path.basename(img_path)}")
             frame_images.append(preprocess_image(img_path))
             with Image.open(img_path) as img:
                 sizes.append(img.size)
@@ -450,11 +450,19 @@ def main(args):
     # images_tensor = torch.stack(images).to(device) # Without batch dimension
     print(f"images_tensor: {images_tensor.shape}")
 
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start_time = time.perf_counter()
+
     with torch.no_grad():
         with torch.amp.autocast(device, dtype=dtype):
             # images (torch.Tensor): Input images with shape [T, V, 3, H, W] or [B, T, V, 3, H, W], in range [0, 1].
             # B: batch size, T: num_frames, V: views_per_frame, 3: RGB channels, H: height, W: width
             preds = model(images_tensor)
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    inference_time = time.perf_counter() - start_time
 
     ego_n_to_ego_0 = pose_encoding_to_ego_pose(preds['ego_pose_enc'])
     pred_ego_poses = ego_n_to_ego_0[0].cpu().numpy()  # (T, 3, 4)
@@ -490,8 +498,8 @@ def main(args):
     r_errors = r_errors.numpy()
     t_errors = t_errors.numpy()
 
-    print(f"R errors (deg) — min: {r_errors.min():.3f}, max: {r_errors.max():.3f}, mean: {r_errors.mean():.3f}")
-    print(f"T errors (deg) — min: {t_errors.min():.3f}, max: {t_errors.max():.3f}, mean: {t_errors.mean():.3f}")
+    # print(f"R errors (deg) — min: {r_errors.min():.3f}, max: {r_errors.max():.3f}, mean: {r_errors.mean():.3f}")
+    # print(f"T errors (deg) — min: {t_errors.min():.3f}, max: {t_errors.max():.3f}, mean: {t_errors.mean():.3f}")
     auc30 = calculate_auc_np(r_errors, t_errors, max_threshold=30)
     print(f"Pose AUC@30: {auc30 * 100:.2f}")
 
@@ -506,8 +514,8 @@ def main(args):
 
     acc, acc_median = accuracy(gt_pts_ego0_nusc, pred_pts_nusc)
     comp, comp_median = completion(gt_pts_ego0_nusc, pred_pts_nusc)
-    print(f"Point Map Accuracy:     {acc:.4f} m  (median: {acc_median:.4f} m)")
-    print(f"Point Map Completeness: {comp:.4f} m  (median: {comp_median:.4f} m)")
+    print(f"Point Map Acc:  {acc:.4f} m  (median: {acc_median:.4f} m)")
+    print(f"Point Map Comp: {comp:.4f} m  (median: {comp_median:.4f} m)")
 
     # Ray Depth Metrics (AbsRel & δ < 1.25)
     print("\nComputing ray depth metrics...")
@@ -534,6 +542,16 @@ def main(args):
         d_pred = np.concatenate(all_d_pred)
         print(f"Ray Depth AbsRel: {ray_depth_absrel(d_gt, d_pred):.4f}")
         print(f"Ray Depth δ<1.25: {ray_depth_delta(d_gt, d_pred):.4f}")
+
+    print("\n" + "-" * 50)
+    print("Profiling Metrics:")
+    print(f"  Inference Time (for {args.frames}-frame seq): {inference_time:.4f} s")
+    print(f"  Effective Inference FPS: {args.frames / inference_time:.2f}")
+    if torch.cuda.is_available():
+        peak_vram_alloc = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        peak_vram_reserv = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+        print(f"  Peak VRAM Allocated: {peak_vram_alloc:.2f} MB")
+        print(f"  Peak VRAM Reserved:  {peak_vram_reserv:.2f} MB")
 
     if (args.vis):
         vis_args = argparse.Namespace(
