@@ -343,7 +343,7 @@ def main(args):
     print(f"R errors (deg) — min: {r_errors.min():.3f}, max: {r_errors.max():.3f}, mean: {r_errors.mean():.3f}")
     print(f"T errors (deg) — min: {t_errors.min():.3f}, max: {t_errors.max():.3f}, mean: {t_errors.mean():.3f}")
     auc30 = calculate_auc_np(r_errors, t_errors, max_threshold=30)
-    print(f"Pose AUC@30: {auc30:.4f}")
+    print(f"Pose AUC@30: {auc30 * 100:.2f}")
 
     if (args.vis):
         vis_args = argparse.Namespace(
