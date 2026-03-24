@@ -515,8 +515,8 @@ def main(args):
 
     acc, acc_median = accuracy(gt_pts_ego0_nusc, pred_pts_nusc)
     comp, comp_median = completion(gt_pts_ego0_nusc, pred_pts_nusc)
-    print(f"Point Map Acc:  {acc:.4f} m  (median: {acc_median:.4f} m)")
-    print(f"Point Map Comp: {comp:.4f} m  (median: {comp_median:.4f} m)")
+    print(f"Point Map Acc:  mean: {acc:.4f} m, median: {acc_median:.4f} m")
+    print(f"Point Map Comp: mean: {comp:.4f} m, median: {comp_median:.4f} m")
 
     # Ray Depth Metrics (AbsRel & δ < 1.25)
     print("\nComputing ray depth metrics...")
