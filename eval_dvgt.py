@@ -14,6 +14,8 @@ from demo_viser import visualize_pred, launch_viser_server
 from dvgt.utils.pose_enc import pose_encoding_to_ego_pose
 from dvgt.utils.geometry import convert_point_in_ego_0_to_ray_depth_in_ego_n
 from dvgt.utils.rotation import mat_to_quat
+from scipy.spatial import cKDTree as KDTree
+from nuscenes.utils.data_classes import LidarPointCloud
 
 # Predict in alphabetical order to match standard loading
 CAMERAS = [
@@ -232,6 +234,154 @@ def get_transform_matrix(translation, rotation):
     T[:3, 3] = translation
     return T
 
+# =============================================================================
+# Point Map Metrics
+# Verbatim from https://github.com/yyfz/Pi3/blob/evaluation/mv_recon/utils.py
+# =============================================================================
+
+def accuracy(gt_points, rec_points, gt_normals=None, rec_normals=None):
+    gt_points_kd_tree = KDTree(gt_points)
+    distances, idx = gt_points_kd_tree.query(rec_points, workers=-1)
+    acc = np.mean(distances)
+    acc_median = np.median(distances)
+
+    if gt_normals is not None and rec_normals is not None:
+        normal_dot = np.sum(gt_normals[idx] * rec_normals, axis=-1)
+        normal_dot = np.abs(normal_dot)
+        return acc, acc_median, np.mean(normal_dot), np.median(normal_dot)
+
+    return acc, acc_median
+
+
+def completion(gt_points, rec_points, gt_normals=None, rec_normals=None):
+    gt_points_kd_tree = KDTree(rec_points)
+    distances, idx = gt_points_kd_tree.query(gt_points, workers=-1)
+    comp = np.mean(distances)
+    comp_median = np.median(distances)
+
+    if gt_normals is not None and rec_normals is not None:
+        normal_dot = np.sum(gt_normals * rec_normals[idx], axis=-1)
+        normal_dot = np.abs(normal_dot)
+        return comp, comp_median, np.mean(normal_dot), np.median(normal_dot)
+
+    return comp, comp_median
+
+
+# =============================================================================
+# Ray Depth Metrics (DVGT paper Appendix B)
+# =============================================================================
+
+def ray_depth_absrel(d_gt, d_pred):
+    """AbsRel on scalar ray depths: mean(|pred - gt| / gt) (↓ better)."""
+    return float(np.mean(np.abs(d_pred - d_gt) / d_gt))
+
+
+def ray_depth_delta(d_gt, d_pred, threshold=1.25):
+    """Fraction of pixels with max(pred/gt, gt/pred) < threshold (↑ better)."""
+    ratio = np.maximum(d_pred / d_gt, d_gt / d_pred)
+    return float(np.mean(ratio < threshold))
+
+
+# =============================================================================
+# nuScenes LiDAR helpers
+# =============================================================================
+
+def get_lidar_points_in_ego_0(nusc, sample_tokens, world_to_ego_0):
+    """
+    Aggregate LIDAR_TOP points from all frames into ego_0 nuScenes frame.
+    Returns np.ndarray of shape (N, 3).
+    """
+    all_points = []
+    for token in sample_tokens:
+        sample = nusc.get('sample', token)
+        lidar_token = sample['data']['LIDAR_TOP']
+        lidar_data = nusc.get('sample_data', lidar_token)
+
+        pc = LidarPointCloud.from_file(os.path.join(nusc.dataroot, lidar_data['filename']))
+        pts = pc.points[:3, :]  # (3, N)
+
+        cs = nusc.get('calibrated_sensor', lidar_data['calibrated_sensor_token'])
+        R_l2e = Quaternion(cs['rotation']).rotation_matrix
+        t_l2e = np.array(cs['translation'])
+        pts_ego_n = R_l2e @ pts + t_l2e[:, None]  # (3, N) nuScenes ego frame
+
+        ep = nusc.get('ego_pose', lidar_data['ego_pose_token'])
+        ego_n_to_world = get_transform_matrix(ep['translation'], ep['rotation'])
+        pts_h = np.vstack([pts_ego_n, np.ones((1, pts_ego_n.shape[1]))])  # (4, N)
+        pts_ego_0 = (world_to_ego_0 @ (ego_n_to_world @ pts_h))[:3, :].T  # (N, 3)
+
+        all_points.append(pts_ego_0)
+
+    return np.vstack(all_points)
+
+
+def get_sparse_ray_depth_gt_per_frame(nusc, sample_token, cameras, cam_img_sizes, target_size=512):
+    """
+    Project LIDAR_TOP points onto each camera to produce sparse GT ray depth maps.
+    Ray depth = L2 norm of each point in the ego frame.
+
+    Returns: list of (H_proc, W_proc) float32 arrays, one per camera in `cameras`.
+             Zero entries indicate no LiDAR coverage at that pixel.
+    """
+    sample = nusc.get('sample', sample_token)
+    lidar_token = sample['data']['LIDAR_TOP']
+    lidar_data = nusc.get('sample_data', lidar_token)
+
+    pc = LidarPointCloud.from_file(os.path.join(nusc.dataroot, lidar_data['filename']))
+    pts_lidar = pc.points[:3, :]  # (3, N)
+
+    cs_lidar = nusc.get('calibrated_sensor', lidar_data['calibrated_sensor_token'])
+    R_l2e = Quaternion(cs_lidar['rotation']).rotation_matrix
+    t_l2e = np.array(cs_lidar['translation'])
+    pts_ego = R_l2e @ pts_lidar + t_l2e[:, None]  # (3, N) nuScenes ego frame
+
+    gt_ray_depth = np.linalg.norm(pts_ego, axis=0)  # (N,)
+
+    sparse_maps = []
+    for cam_idx, cam in enumerate(cameras):
+        cam_data = nusc.get('sample_data', sample['data'][cam])
+        cs_cam = nusc.get('calibrated_sensor', cam_data['calibrated_sensor_token'])
+
+        R_c2e = Quaternion(cs_cam['rotation']).rotation_matrix
+        t_c2e = np.array(cs_cam['translation'])
+        R_e2c = R_c2e.T
+        t_e2c = -R_e2c @ t_c2e
+        pts_cam = R_e2c @ pts_ego + t_e2c[:, None]  # (3, N)
+
+        front = pts_cam[2, :] > 0
+        pts_cam_f = pts_cam[:, front]
+        d_f = gt_ray_depth[front]
+
+        K = np.array(cs_cam['camera_intrinsic'])
+        uv = K @ (pts_cam_f / pts_cam_f[2:3, :])  # (3, N) homogeneous
+        u, v = uv[0, :], uv[1, :]
+
+        orig_w, orig_h = cam_img_sizes[cam_idx]
+        new_w = target_size
+        new_h = round(orig_h * (new_w / orig_w) / 16) * 16
+        u = u * (new_w / orig_w)
+        v = v * (new_h / orig_h)
+
+        if new_h > target_size:
+            v = v - (new_h - target_size) // 2
+            proc_h = target_size
+        else:
+            proc_h = new_h
+
+        in_bounds = (u >= 0) & (u < new_w) & (v >= 0) & (v < proc_h)
+        u_i = u[in_bounds].astype(np.int32)
+        v_i = v[in_bounds].astype(np.int32)
+        d_i = d_f[in_bounds]
+
+        depth_map = np.zeros((proc_h, new_w), dtype=np.float32)
+        # Sort descending so the nearest point overwrites farther ones at the same pixel
+        order = np.argsort(d_i)[::-1]
+        depth_map[v_i[order], u_i[order]] = d_i[order]
+        sparse_maps.append(depth_map)
+
+    return sparse_maps
+
+
 def preprocess_image(img_path, target_size=512):
     """Preprocess image matching DVGT's aspect ratio and cropping logic."""
     img = Image.open(img_path).convert("RGB")
@@ -344,6 +494,46 @@ def main(args):
     print(f"T errors (deg) — min: {t_errors.min():.3f}, max: {t_errors.max():.3f}, mean: {t_errors.mean():.3f}")
     auc30 = calculate_auc_np(r_errors, t_errors, max_threshold=30)
     print(f"Pose AUC@30: {auc30 * 100:.2f}")
+
+    # Point Map Metrics (Accuracy & Completeness)
+    print("\nComputing point map metrics...")
+    gt_pts_ego0_nusc = get_lidar_points_in_ego_0(nusc, sample_tokens, world_to_ego_0)
+
+    # world_points are in ego_0 OpenCV frame; rotate to nuScenes frame for comparison
+    pred_pts_cv = preds['world_points'][0].cpu().float().numpy().reshape(-1, 3)
+    R_cv_to_nusc = T_cv_to_nusc[:3, :3]
+    pred_pts_nusc = pred_pts_cv @ R_cv_to_nusc.T
+
+    acc, acc_median = accuracy(gt_pts_ego0_nusc, pred_pts_nusc)
+    comp, comp_median = completion(gt_pts_ego0_nusc, pred_pts_nusc)
+    print(f"Point Map Accuracy:     {acc:.4f} m  (median: {acc_median:.4f} m)")
+    print(f"Point Map Completeness: {comp:.4f} m  (median: {comp_median:.4f} m)")
+
+    # Ray Depth Metrics (AbsRel & δ < 1.25)
+    print("\nComputing ray depth metrics...")
+    pred_ray_depth = convert_point_in_ego_0_to_ray_depth_in_ego_n(
+        preds['world_points'], ego_n_to_ego_0
+    )[0].cpu().numpy()  # (T, V, H, W)
+
+    all_d_gt, all_d_pred = [], []
+    for t_idx, token in enumerate(sample_tokens):
+        sparse_maps = get_sparse_ray_depth_gt_per_frame(
+            nusc, token, CAMERAS, cam_img_sizes[t_idx]
+        )
+        for v_idx, depth_map in enumerate(sparse_maps):
+            mask = depth_map > 0
+            if not mask.any():
+                continue
+            proc_h, proc_w = depth_map.shape
+            pred_slice = pred_ray_depth[t_idx, v_idx, :proc_h, :proc_w]
+            all_d_gt.append(depth_map[mask])
+            all_d_pred.append(pred_slice[mask])
+
+    if all_d_gt:
+        d_gt = np.concatenate(all_d_gt)
+        d_pred = np.concatenate(all_d_pred)
+        print(f"Ray Depth AbsRel: {ray_depth_absrel(d_gt, d_pred):.4f}")
+        print(f"Ray Depth δ<1.25: {ray_depth_delta(d_gt, d_pred):.4f}")
 
     if (args.vis):
         vis_args = argparse.Namespace(
