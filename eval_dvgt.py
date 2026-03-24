@@ -403,21 +403,8 @@ def main(args):
     checkpoint_path = 'ckpt/open_ckpt.pt'
 
     device = "cuda"
-    # bfloat16 is supported on Ampere GPUs (Compute Capability 8.0+) 
-    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
-    # Initialize the model and load the pretrained weights.
-    model = DVGT()
-    with g_pathmgr.open(checkpoint_path, "rb") as f:
-        checkpoint = torch.load(f, map_location="cpu")
-    model.load_state_dict(checkpoint)
-    model = model.to(device).eval()
-
-    # Load and preprocess example images (replace with your own image paths)
-    # image_dir = 'examples/openscene_log-0104-scene-0007'
-    # images = load_and_preprocess_images(image_dir, start_frame=16, end_frame=23).to(device)
-
-    nusc = NuScenes(version='v1.0-mini', dataroot=args.dataroot, verbose=True)
+    nusc = NuScenes(version='v1.0-mini', dataroot=args.dataroot, verbose=False)
     scene = nusc.scene[args.scene]
     sample_token = scene['first_sample_token']
     sample_tokens = []
@@ -449,6 +436,15 @@ def main(args):
     images_tensor = torch.stack(images).unsqueeze(0).to(device) # With batch dimension
     # images_tensor = torch.stack(images).to(device) # Without batch dimension
     print(f"images_tensor: {images_tensor.shape}")
+
+    # bfloat16 is supported on Ampere GPUs (Compute Capability 8.0+) 
+    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    # Initialize the model and load the pretrained weights.
+    model = DVGT()
+    with g_pathmgr.open(checkpoint_path, "rb") as f:
+        checkpoint = torch.load(f, map_location="cpu")
+    model.load_state_dict(checkpoint)
+    model = model.to(device).eval()
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -498,6 +494,7 @@ def main(args):
     r_errors = r_errors.numpy()
     t_errors = t_errors.numpy()
 
+    print("\nComputing pose estimation metrics...")
     print(f"R errors (deg) — min: {r_errors.min():.3f}, max: {r_errors.max():.3f}, mean: {r_errors.mean():.3f}")
     print(f"T errors (deg) — min: {t_errors.min():.3f}, max: {t_errors.max():.3f}, mean: {t_errors.mean():.3f}")
     auc30 = calculate_auc_np(r_errors, t_errors, max_threshold=30)
