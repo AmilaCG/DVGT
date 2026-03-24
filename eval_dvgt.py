@@ -27,6 +27,8 @@ CAMERAS = [
     "CAM_FRONT_RIGHT",
 ]
 
+TARGET_SIZE = 512
+
 # =============================================================================
 # Pose Evaluation (adapted from Depth-Anything-3/src/depth_anything_3/bench/utils.py)
 # =============================================================================
@@ -315,7 +317,7 @@ def get_lidar_points_in_ego_0(nusc, sample_tokens, world_to_ego_0):
     return np.vstack(all_points)
 
 
-def get_sparse_ray_depth_gt_per_frame(nusc, sample_token, cameras, cam_img_sizes, target_size=512):
+def get_sparse_ray_depth_gt_per_frame(nusc, sample_token, cameras, cam_img_sizes, target_size=TARGET_SIZE):
     """
     Project LIDAR_TOP points onto each camera to produce sparse GT ray depth maps.
     Ray depth = L2 norm of each point in the ego frame.
@@ -382,7 +384,7 @@ def get_sparse_ray_depth_gt_per_frame(nusc, sample_token, cameras, cam_img_sizes
     return sparse_maps
 
 
-def preprocess_image(img_path, target_size=512):
+def preprocess_image(img_path, target_size=TARGET_SIZE):
     """Preprocess image matching DVGT's aspect ratio and cropping logic."""
     img = Image.open(img_path).convert("RGB")
     width, height = img.size
