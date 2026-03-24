@@ -418,7 +418,7 @@ def main(args):
     # images = load_and_preprocess_images(image_dir, start_frame=16, end_frame=23).to(device)
 
     nusc = NuScenes(version='v1.0-mini', dataroot=args.dataroot, verbose=True)
-    scene = nusc.scene[4]
+    scene = nusc.scene[args.scene]
     sample_token = scene['first_sample_token']
     sample_tokens = []
     while sample_token != '':
@@ -498,8 +498,8 @@ def main(args):
     r_errors = r_errors.numpy()
     t_errors = t_errors.numpy()
 
-    # print(f"R errors (deg) — min: {r_errors.min():.3f}, max: {r_errors.max():.3f}, mean: {r_errors.mean():.3f}")
-    # print(f"T errors (deg) — min: {t_errors.min():.3f}, max: {t_errors.max():.3f}, mean: {t_errors.mean():.3f}")
+    print(f"R errors (deg) — min: {r_errors.min():.3f}, max: {r_errors.max():.3f}, mean: {r_errors.mean():.3f}")
+    print(f"T errors (deg) — min: {t_errors.min():.3f}, max: {t_errors.max():.3f}, mean: {t_errors.mean():.3f}")
     auc30 = calculate_auc_np(r_errors, t_errors, max_threshold=30)
     print(f"Pose AUC@30: {auc30 * 100:.2f}")
 
@@ -571,6 +571,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataroot', type=str, default=os.path.expanduser('~/datasets/nuscenes-mini'))
     # parser.add_argument('--checkpoint', type=str, default='ckpt/open_ckpt.pt')
     parser.add_argument('--frames', type=int, default=16, choices=range(1, 25), help="Frames to evaluate per scene (Max 24).")
+    parser.add_argument('--scene', type=int, default=0, choices=range(0, 10), help="Nuscene sample scene index.")
     # parser.add_argument('--frames_chunk_size', type=int, default=8)
     parser.add_argument('--vis', action='store_true', help='Visualize using Viser')
     args = parser.parse_args()
