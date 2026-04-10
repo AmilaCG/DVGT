@@ -406,8 +406,9 @@ def main(args):
 
     device = "cuda"
 
-    nusc = NuScenes(version='v1.0-mini', dataroot=args.dataroot, verbose=False)
+    nusc = NuScenes(version=args.nusc_version, dataroot=args.dataroot, verbose=False)
     scene = nusc.scene[args.scene]
+    print(f"Scene {args.scene}: name={scene['name']}, token={scene['token']}")
     sample_token = scene['first_sample_token']
     sample_tokens = []
     while sample_token != '':
@@ -570,9 +571,10 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataroot', type=str, default=os.path.expanduser('~/datasets/nuscenes-mini'))
+    parser.add_argument('--nusc_version', type=str, default='v1.0-mini', help="NuScenes version (e.g. v1.0-mini, v1.0-trainval).")
     # parser.add_argument('--checkpoint', type=str, default='ckpt/open_ckpt.pt')
     parser.add_argument('--frames', type=int, default=16, choices=range(1, 25), help="Frames to evaluate per scene (Max 24).")
-    parser.add_argument('--scene', type=int, default=0, choices=range(0, 10), help="Nuscene sample scene index.")
+    parser.add_argument('--scene', type=int, default=0, help="NuScenes scene index.")
     # parser.add_argument('--frames_chunk_size', type=int, default=8)
     parser.add_argument('--vis', action='store_true', help='Visualize using Viser')
     args = parser.parse_args()
