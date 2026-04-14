@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import time
 import torch
 import numpy as np
@@ -26,6 +27,9 @@ CAMERAS = [
     "CAM_FRONT_LEFT",
     "CAM_FRONT_RIGHT",
 ]
+
+# Waymo camera suffixes: _0 = Front, _1 = Front Left, _2 = Front Right
+WAYMO_CAM_SUFFIXES = ["_0", "_1", "_2"]
 
 TARGET_SIZE = 512
 
@@ -401,39 +405,79 @@ def preprocess_image(img_path, target_size=TARGET_SIZE):
         
     return img_t
 
+def load_waymo_frames(data_dir, max_frames=None):
+    """
+    Scan data_dir for images named {frame_id}_{cam}.png and group by frame_id.
+    Only frames that have all three views (_0, _1, _2) are included.
+    Returns sorted list of {suffix: path} dicts, one per frame.
+    """
+    pattern = re.compile(r"^(\d+)(_\d+)\.png$")
+    frame_map = {}
+    for fname in os.listdir(data_dir):
+        m = pattern.match(fname)
+        if not m:
+            continue
+        frame_id, suffix = m.group(1), m.group(2)
+        frame_map.setdefault(frame_id, {})[suffix] = os.path.join(data_dir, fname)
+
+    complete = {
+        fid: paths
+        for fid, paths in frame_map.items()
+        if all(s in paths for s in WAYMO_CAM_SUFFIXES)
+    }
+    sorted_ids = sorted(complete.keys())
+    if max_frames is not None:
+        sorted_ids = sorted_ids[:max_frames]
+    return [complete[fid] for fid in sorted_ids]
+
+
 def main(args):
     checkpoint_path = 'ckpt/open_ckpt.pt'
 
     device = "cuda"
 
-    nusc = NuScenes(version=args.nusc_version, dataroot=args.dataroot, verbose=False)
-    scene = nusc.scene[args.scene]
-    print(f"Scene {args.scene}: name={scene['name']}, token={scene['token']}")
-    sample_token = scene['first_sample_token']
-    sample_tokens = []
-    while sample_token != '':
-        sample_tokens.append(sample_token)
-        sample = nusc.get('sample', sample_token)
-        sample_token = sample['next']
+    if args.waymo_dir:
+        waymo_frames = load_waymo_frames(args.waymo_dir, max_frames=args.frames)
+        T = len(waymo_frames)
+        print(f"Loaded {T} frames from {args.waymo_dir} (_0=Front, _1=Front Left, _2=Front Right)")
+        nusc = None
+        sample_tokens = []
+        cam_img_sizes = []
+        images = []
+        for paths in waymo_frames:
+            frame_images = []
+            for suffix in WAYMO_CAM_SUFFIXES:
+                frame_images.append(preprocess_image(paths[suffix]))
+            images.append(torch.stack(frame_images))
+    else:
+        nusc = NuScenes(version=args.nusc_version, dataroot=args.dataroot, verbose=False)
+        scene = nusc.scene[args.scene]
+        print(f"Scene {args.scene}: name={scene['name']}, token={scene['token']}")
+        sample_token = scene['first_sample_token']
+        sample_tokens = []
+        while sample_token != '':
+            sample_tokens.append(sample_token)
+            sample = nusc.get('sample', sample_token)
+            sample_token = sample['next']
 
-    print(f"Sample tokens: {len(sample_tokens)}")
-    # Cap sample tokens
-    sample_tokens = sample_tokens[:args.frames]
-    T = len(sample_tokens)
-    
-    images, cam_img_sizes = [], []
-    for token in sample_tokens:
-        sample = nusc.get('sample', token)
-        frame_images, sizes = [], []
-        for cam in CAMERAS:
-            cam_data = nusc.get('sample_data', sample['data'][cam])
-            img_path = os.path.join(nusc.dataroot, cam_data['filename'])
-            # print(f"Feeding image: {os.path.basename(img_path)}")
-            frame_images.append(preprocess_image(img_path))
-            with Image.open(img_path) as img:
-                sizes.append(img.size)
-        images.append(torch.stack(frame_images))
-        cam_img_sizes.append(sizes)
+        print(f"Sample tokens: {len(sample_tokens)}")
+        # Cap sample tokens
+        sample_tokens = sample_tokens[:args.frames]
+        T = len(sample_tokens)
+
+        images, cam_img_sizes = [], []
+        for token in sample_tokens:
+            sample = nusc.get('sample', token)
+            frame_images, sizes = [], []
+            for cam in CAMERAS:
+                cam_data = nusc.get('sample_data', sample['data'][cam])
+                img_path = os.path.join(nusc.dataroot, cam_data['filename'])
+                # print(f"Feeding image: {os.path.basename(img_path)}")
+                frame_images.append(preprocess_image(img_path))
+                with Image.open(img_path) as img:
+                    sizes.append(img.size)
+            images.append(torch.stack(frame_images))
+            cam_img_sizes.append(sizes)
 
     print(f"Feeding {len(images)} frames, each with {len(images[0])} views")
     images_tensor = torch.stack(images).unsqueeze(0).to(device) # With batch dimension
@@ -470,80 +514,83 @@ def main(args):
     pred_poses_44[:, :3, :] = pred_ego_poses
     pred_poses_44[:, 3, 3] = 1.0
 
-    # Compute GT poses (ego_n_to_ego_0) from nuScenes
-    sample_0 = nusc.get('sample', sample_tokens[0])
-    ego_pose_0 = nusc.get('ego_pose', nusc.get('sample_data', sample_0['data']['CAM_FRONT'])['ego_pose_token'])
-    world_to_ego_0 = np.linalg.inv(get_transform_matrix(ego_pose_0['translation'], ego_pose_0['rotation']))
+    # Compute GT poses (ego_n_to_ego_0) from nuScenes (skipped in Waymo mode)
+    if nusc is None:
+        print("\n(Skipping pose / point-map / ray-depth metrics — no GT available for Waymo)")
+    else:
+        sample_0 = nusc.get('sample', sample_tokens[0])
+        ego_pose_0 = nusc.get('ego_pose', nusc.get('sample_data', sample_0['data']['CAM_FRONT'])['ego_pose_token'])
+        world_to_ego_0 = np.linalg.inv(get_transform_matrix(ego_pose_0['translation'], ego_pose_0['rotation']))
 
-    gt_poses_44 = []
-    for token in sample_tokens:
-        sample = nusc.get('sample', token)
-        ego_pose_n = nusc.get('ego_pose', nusc.get('sample_data', sample['data']['CAM_FRONT'])['ego_pose_token'])
-        ego_n_to_world = get_transform_matrix(ego_pose_n['translation'], ego_pose_n['rotation'])
-        gt_poses_44.append(world_to_ego_0 @ ego_n_to_world)
-    gt_poses_44 = np.stack(gt_poses_44)
+        gt_poses_44 = []
+        for token in sample_tokens:
+            sample = nusc.get('sample', token)
+            ego_pose_n = nusc.get('ego_pose', nusc.get('sample_data', sample['data']['CAM_FRONT'])['ego_pose_token'])
+            ego_n_to_world = get_transform_matrix(ego_pose_n['translation'], ego_pose_n['rotation'])
+            gt_poses_44.append(world_to_ego_0 @ ego_n_to_world)
+        gt_poses_44 = np.stack(gt_poses_44)
 
-    # Convert predicted poses from OpenCV to nuScenes convention
-    R_nusc_to_cv = np.array([[0, -1, 0], [0, 0, -1], [1, 0, 0]], dtype=np.float64)
-    T_nusc_to_cv = np.eye(4, dtype=np.float64)
-    T_nusc_to_cv[:3, :3] = R_nusc_to_cv
-    T_cv_to_nusc = np.linalg.inv(T_nusc_to_cv)
-    pred_poses_nusc = np.array([T_cv_to_nusc @ p @ T_nusc_to_cv for p in pred_poses_44])
+        # Convert predicted poses from OpenCV to nuScenes convention
+        R_nusc_to_cv = np.array([[0, -1, 0], [0, 0, -1], [1, 0, 0]], dtype=np.float64)
+        T_nusc_to_cv = np.eye(4, dtype=np.float64)
+        T_nusc_to_cv[:3, :3] = R_nusc_to_cv
+        T_cv_to_nusc = np.linalg.inv(T_nusc_to_cv)
+        pred_poses_nusc = np.array([T_cv_to_nusc @ p @ T_nusc_to_cv for p in pred_poses_44])
 
-    # Compute pairwise rotation and translation angle errors
-    pred_t = torch.from_numpy(pred_poses_nusc).float()
-    gt_t = torch.from_numpy(gt_poses_44).float()
-    r_errors, t_errors = se3_to_relative_pose_error(pred_t, gt_t, T)
-    r_errors = r_errors.numpy()
-    t_errors = t_errors.numpy()
+        # Compute pairwise rotation and translation angle errors
+        pred_t = torch.from_numpy(pred_poses_nusc).float()
+        gt_t = torch.from_numpy(gt_poses_44).float()
+        r_errors, t_errors = se3_to_relative_pose_error(pred_t, gt_t, T)
+        r_errors = r_errors.numpy()
+        t_errors = t_errors.numpy()
 
-    print("\nComputing pose estimation metrics...")
-    print(f"R errors (deg) — min: {r_errors.min():.3f}, max: {r_errors.max():.3f}, mean: {r_errors.mean():.3f}, median: {np.median(r_errors):.3f}")
-    print(f"T errors (deg) — min: {t_errors.min():.3f}, max: {t_errors.max():.3f}, mean: {t_errors.mean():.3f}, median: {np.median(t_errors):.3f}")
-    auc30 = calculate_auc_np(r_errors, t_errors, max_threshold=30)
-    auc15 = calculate_auc_np(r_errors, t_errors, max_threshold=15)
-    print(f"Pose AUC@30: {auc30 * 100:.2f}")
-    print(f"Pose AUC@15: {auc15 * 100:.2f}")
+        print("\nComputing pose estimation metrics...")
+        print(f"R errors (deg) — min: {r_errors.min():.3f}, max: {r_errors.max():.3f}, mean: {r_errors.mean():.3f}, median: {np.median(r_errors):.3f}")
+        print(f"T errors (deg) — min: {t_errors.min():.3f}, max: {t_errors.max():.3f}, mean: {t_errors.mean():.3f}, median: {np.median(t_errors):.3f}")
+        auc30 = calculate_auc_np(r_errors, t_errors, max_threshold=30)
+        auc15 = calculate_auc_np(r_errors, t_errors, max_threshold=15)
+        print(f"Pose AUC@30: {auc30 * 100:.2f}")
+        print(f"Pose AUC@15: {auc15 * 100:.2f}")
 
-    # Point Map Metrics (Accuracy & Completeness)
-    print("\nComputing point map metrics...")
-    gt_pts_ego0_nusc = get_lidar_points_in_ego_0(nusc, sample_tokens, world_to_ego_0)
+        # Point Map Metrics (Accuracy & Completeness)
+        print("\nComputing point map metrics...")
+        gt_pts_ego0_nusc = get_lidar_points_in_ego_0(nusc, sample_tokens, world_to_ego_0)
 
-    # world_points are in ego_0 OpenCV frame; rotate to nuScenes frame for comparison
-    pred_pts_cv = preds['world_points'][0].cpu().float().numpy().reshape(-1, 3)
-    R_cv_to_nusc = T_cv_to_nusc[:3, :3]
-    pred_pts_nusc = pred_pts_cv @ R_cv_to_nusc.T
+        # world_points are in ego_0 OpenCV frame; rotate to nuScenes frame for comparison
+        pred_pts_cv = preds['world_points'][0].cpu().float().numpy().reshape(-1, 3)
+        R_cv_to_nusc = T_cv_to_nusc[:3, :3]
+        pred_pts_nusc = pred_pts_cv @ R_cv_to_nusc.T
 
-    acc, acc_median = accuracy(gt_pts_ego0_nusc, pred_pts_nusc)
-    comp, comp_median = completion(gt_pts_ego0_nusc, pred_pts_nusc)
-    print(f"Point Map Acc:  mean: {acc:.4f} m, median: {acc_median:.4f} m")
-    print(f"Point Map Comp: mean: {comp:.4f} m, median: {comp_median:.4f} m")
+        acc, acc_median = accuracy(gt_pts_ego0_nusc, pred_pts_nusc)
+        comp, comp_median = completion(gt_pts_ego0_nusc, pred_pts_nusc)
+        print(f"Point Map Acc:  mean: {acc:.4f} m, median: {acc_median:.4f} m")
+        print(f"Point Map Comp: mean: {comp:.4f} m, median: {comp_median:.4f} m")
 
-    # Ray Depth Metrics (AbsRel & δ < 1.25)
-    print("\nComputing ray depth metrics...")
-    pred_ray_depth = convert_point_in_ego_0_to_ray_depth_in_ego_n(
-        preds['world_points'], ego_n_to_ego_0
-    )[0].cpu().numpy()  # (T, V, H, W)
+        # Ray Depth Metrics (AbsRel & δ < 1.25)
+        print("\nComputing ray depth metrics...")
+        pred_ray_depth = convert_point_in_ego_0_to_ray_depth_in_ego_n(
+            preds['world_points'], ego_n_to_ego_0
+        )[0].cpu().numpy()  # (T, V, H, W)
 
-    all_d_gt, all_d_pred = [], []
-    for t_idx, token in enumerate(sample_tokens):
-        sparse_maps = get_sparse_ray_depth_gt_per_frame(
-            nusc, token, CAMERAS, cam_img_sizes[t_idx]
-        )
-        for v_idx, depth_map in enumerate(sparse_maps):
-            mask = depth_map > 0
-            if not mask.any():
-                continue
-            proc_h, proc_w = depth_map.shape
-            pred_slice = pred_ray_depth[t_idx, v_idx, :proc_h, :proc_w]
-            all_d_gt.append(depth_map[mask])
-            all_d_pred.append(pred_slice[mask])
+        all_d_gt, all_d_pred = [], []
+        for t_idx, token in enumerate(sample_tokens):
+            sparse_maps = get_sparse_ray_depth_gt_per_frame(
+                nusc, token, CAMERAS, cam_img_sizes[t_idx]
+            )
+            for v_idx, depth_map in enumerate(sparse_maps):
+                mask = depth_map > 0
+                if not mask.any():
+                    continue
+                proc_h, proc_w = depth_map.shape
+                pred_slice = pred_ray_depth[t_idx, v_idx, :proc_h, :proc_w]
+                all_d_gt.append(depth_map[mask])
+                all_d_pred.append(pred_slice[mask])
 
-    if all_d_gt:
-        d_gt = np.concatenate(all_d_gt)
-        d_pred = np.concatenate(all_d_pred)
-        print(f"Ray Depth AbsRel: {ray_depth_absrel(d_gt, d_pred):.4f}")
-        print(f"Ray Depth δ<1.25: {ray_depth_delta(d_gt, d_pred):.4f}")
+        if all_d_gt:
+            d_gt = np.concatenate(all_d_gt)
+            d_pred = np.concatenate(all_d_pred)
+            print(f"Ray Depth AbsRel: {ray_depth_absrel(d_gt, d_pred):.4f}")
+            print(f"Ray Depth δ<1.25: {ray_depth_delta(d_gt, d_pred):.4f}")
 
     print("\n" + "-" * 50)
     print("Profiling Metrics:")
@@ -576,6 +623,9 @@ if __name__ == '__main__':
     parser.add_argument('--frames', type=int, default=16, choices=range(1, 25), help="Frames to evaluate per scene (Max 24).")
     parser.add_argument('--scene', type=int, default=0, help="NuScenes scene index.")
     # parser.add_argument('--frames_chunk_size', type=int, default=8)
+    parser.add_argument('--waymo_dir', type=str, default=None,
+                        help="Load images from a Waymo directory ({frame_id}_{cam}.png) instead of nuScenes. "
+                             "_0=Front, _1=Front Left, _2=Front Right. Skips GT evaluation.")
     parser.add_argument('--vis', action='store_true', help='Visualize using Viser')
     args = parser.parse_args()
     main(args)
